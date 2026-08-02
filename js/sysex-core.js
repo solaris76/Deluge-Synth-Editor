@@ -367,12 +367,16 @@ async function ensureSession() {
         return await openSession();
     } catch (error) {
         console.warn('Session negotiation failed, using fallback mode:', error);
-        // Fallback: Create a simple session without negotiation
-        // This works with older firmware or when session protocol is not available
+        // Fallback: Create a simple session without negotiation.
+        // The firmware encodes msgIds as (sid << 3) + (1..7), so a fallback
+        // range must stay inside a single sid block and skip the (sid << 3) + 0
+        // value. The old 0x41-0x4F range straddled two blocks and included
+        // 0x48, whose msgId part is 0; the Deluge never answers that, so the
+        // 8th command in fallback mode always hung.
         currentSession = {
-            sid: 0,
-            midMin: 0x41,  // Use default message ID range
-            midMax: 0x4F,
+            sid: 15,
+            midMin: 0x79,  // (15 << 3) + 1
+            midMax: 0x7F,  // (15 << 3) + 7
             counter: 1
         };
         return currentSession;
@@ -435,13 +439,22 @@ function handleMidiMessage(event) {
 
     const commandPos = isDevId ? 2 : 5;
     const msgIdPos = isDevId ? 3 : 6;
-    
-    // Check if it's a JSON reply
-    if (data[commandPos] !== SYSEX_CMD_JSON_REPLY) {
+
+    const command = data[commandPos];
+    const msgId = data[msgIdPos];
+
+    // Check if it's a JSON reply.
+    // The Deluge answers most commands with JsonReply (0x05), but the session
+    // handshake reply (^session) is sent via smSysex::startDirect(), which uses
+    // the plain Json command byte (0x04) with msgId 0. assignSession() is the
+    // only caller of startDirect(). Accept that one case too, or session
+    // negotiation never completes and every operation stalls until it times out.
+    // Requests we send also use 0x04, so keep the exception pinned to msgId 0.
+    const isReply = command === SYSEX_CMD_JSON_REPLY
+        || (command === SYSEX_CMD_JSON && msgId === 0);
+    if (!isReply) {
         return;
     }
-
-    const msgId = data[msgIdPos];
     const sysexEnd = data.lastIndexOf(SYSEX_END);
     
     if (sysexEnd === -1) {
